@@ -4,6 +4,9 @@ require "logstash/outputs/base"
 require "stud/buffer"
 require "logstash/outputs/webhdfs_helper"
 
+require "date"
+require "time"
+
 # This plugin sends Logstash events into files in HDFS via
 # the https://hadoop.apache.org/docs/r1.0.4/webhdfs.html[webhdfs] REST API.
 #
@@ -36,7 +39,8 @@ require "logstash/outputs/webhdfs_helper"
 #     host => "127.0.0.1"                 # (required)
 #     port => 50070                       # (optional, default: 50070)
 #     path => "/user/logstash/dt=%{+YYYY-MM-dd}/logstash-%{+HH}.log"  # (required)
-#     user => "hue"                       # (required)
+#     user => "hue"                       # (optional if kerberos_keytab is specified)
+#     kerberos_keytab => '/etc/keytab'    # (optional)
 #   }
 # }
 # ----------------------------------
@@ -52,6 +56,8 @@ class LogStash::Outputs::WebHdfs < LogStash::Outputs::Base
   DEFAULT_VERSION = 1
   MINIMUM_COMPATIBLE_VERSION = 1
 
+  STARTUP_TIME = DateTime.now.to_s
+
   # The server name for webhdfs/httpfs connections.
   config :host, :validate => :string, :required => true
 
@@ -65,7 +71,19 @@ class LogStash::Outputs::WebHdfs < LogStash::Outputs::Base
   config :standby_port, :validate => :number, :default => 50070
 
   # The Username for webhdfs.
-  config :user, :validate => :string, :required => true
+  config :user, :validate => :string, :required => false, :default => nil
+
+  # The path to the Kerberos keytab.
+  config :kerberos_keytab, :validate => :string, :required => false, :default => nil
+
+  # The Kerberos principal.
+  config :kerberos_principal, :validate => :string, :required => false, :default => nil
+
+  # The Kerberos service principal.
+  config :kerberos_service_principal, :validate => :string, :required => false, :default => nil
+
+  # How often to renew the Kerberos ticket
+  config :kerberos_renewal_hours, :validate => :number, :required => false, :default => 5
 
   # The path to the file to write to. Event fields can be used here,
   # as well as date fields in the joda time format, e.g.:
@@ -114,6 +132,10 @@ class LogStash::Outputs::WebHdfs < LogStash::Outputs::Base
   ## Set codec.
   default :codec, 'line'
 
+  class << self
+    attr_accessor :kinit_time
+  end
+
   public
 
   def register
@@ -123,19 +145,26 @@ class LogStash::Outputs::WebHdfs < LogStash::Outputs::Base
     elsif @compression == "snappy"
       load_module('snappy')
     end
+
     @main_namenode_failed = false
     @standby_client = false
     @files = {}
+
+    if ! kerberos_keytab.nil?
+      kinit
+      self.class.kinit_time = DateTime.now.to_s
+    end
+
     # Create and test standby client if configured.
     if @standby_host
-      @standby_client = prepare_client(@standby_host, @standby_port, @user)
+      @standby_client = prepare_client(@standby_host, @standby_port, @user, @kerberos_keytab, @kerberos_service_principal)
       begin
         test_client(@standby_client)
       rescue => e
         logger.warn("Could not connect to standby namenode #{@standby_host}. Error: #{e.message}. Trying main webhdfs namenode.")
       end
     end
-    @client = prepare_client(@host, @port, @user)
+    @client = prepare_client(@host, @port, @user, @kerberos_keytab, @kerberos_service_principal)
     begin
       test_client(@client)
     rescue => e
@@ -197,6 +226,13 @@ class LogStash::Outputs::WebHdfs < LogStash::Outputs::Base
   end
 
   def write_data(path, data)
+    if ! kerberos_keytab.nil?
+      if ((Time.parse(DateTime.now.to_s) - Time.parse(self.class.kinit_time))/3600 >= @kerberos_renewal_hours )
+        kinit
+        self.class.kinit_time = DateTime.now.to_s
+      end
+    end
+
     # Retry max_retry times. This can solve problems like leases being hold by another process. Sadly this is no
     # KNOWN_ERROR in rubys webhdfs client.
     write_tries = 0
@@ -240,6 +276,8 @@ class LogStash::Outputs::WebHdfs < LogStash::Outputs::Base
   end
 
   def close
+    kdestroy if ! kerberos_keytab.nil?
     buffer_flush(:final => true)
   end # def close
+
 end # class LogStash::Outputs::WebHdfs
